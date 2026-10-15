@@ -40,8 +40,6 @@ class FileAssembly(val totalSize: Long, chunkCount: Int):
   lock.toFile.deleteOnExit()
 
 
-  // MulticastSocket с портом — у него включён SO_REUSEADDR, поэтому несколько
-  // резервных серверов могут работать на одном компьютере.
   val socket = MulticastSocket(Config.MulticastPort)
   socket.joinGroup(InetAddress.getByName(Config.MulticastGroup)) // вступаем в группу вещания
   println(s"[Резерв $id] Слушаю группу ${Config.MulticastGroup}:${Config.MulticastPort}")
@@ -51,7 +49,7 @@ class FileAssembly(val totalSize: Long, chunkCount: Int):
 
   while true do
     val packet = DatagramPacket(buf, buf.length)
-    socket.receive(packet)                               // блокируется до прихода пакета
+    socket.receive(packet) // блокируется до прихода пакета
 
     val in     = DataInputStream(ByteArrayInputStream(packet.getData, 0, packet.getLength))
     val name   = in.readUTF()

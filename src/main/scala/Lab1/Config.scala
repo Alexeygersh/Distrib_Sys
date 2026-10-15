@@ -7,12 +7,17 @@ object Config:
   val TcpPort         = 5000          // порт основного сервера для клиентов (TCP)
   val MulticastGroup  = "230.0.0.1"   // адрес группы UDP Multicast (диапазон 224.0.0.0 - 239.255.255.255)
   val MulticastPort   = 4446          // порт группового вещания
-  val SyncIntervalSec = 60            // период репликации, сек (для быстрого теста можно поставить 10)
+  val SyncIntervalSec = 60            // период репликации, с
   val ChunkSize       = 8000          // размер одного UDP-пакета с данными (UDP-датаграмма ограничена ~64 КБ)
   val MainStorage     = "storage_main" // папка с файлами основного сервера
 
+  // Файл со списком пользователей (служебный, формат: id|имя|первый вход|последний вход)
+  val UsersFile       = "users.txt"
+  // Служебные файлы: видны в list, но их нельзя скачать/загрузить, и они не реплицируются
+  val ProtectedFiles  = Set(UsersFile)
+
 // Общая вспомогательная функция: сервер использует её при загрузке файла,
-// клиент — при скачивании. Читает из сети РОВНО size байт и пишет их в файл.
+// клиент — при скачивании. Читает из сети size байт и пишет их в файл.
 object IoUtil:
   def copyExactly(in: DataInputStream, out: OutputStream, size: Long): Unit =
     val buf = new Array[Byte](4096)

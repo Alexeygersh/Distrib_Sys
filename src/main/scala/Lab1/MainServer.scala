@@ -4,7 +4,6 @@ import java.io.*
 import java.net.*
 import java.nio.file.*
 import java.util.concurrent.*
-import java.util.concurrent.atomic.AtomicInteger
 import scala.jdk.CollectionConverters.*
 
 // ---------------------------------------------------------------------------
@@ -21,8 +20,7 @@ class ClientSession(val id: Int, val name: String, out: DataOutputStream):
       out.writeUTF(text)
       out.flush()
 
-  // Отправка файла клиенту (скачивание). Блокировка держится всё время передачи,
-  // чтобы чужие уведомления не «вклинились» в середину файла.
+  // Отправка файла клиенту (скачивание)
   def sendFile(fileName: String, path: Path): Unit =
     out.synchronized:
       out.writeUTF("FILE")
@@ -32,43 +30,50 @@ class ClientSession(val id: Int, val name: String, out: DataOutputStream):
       out.flush()
 
 // ---------------------------------------------------------------------------
-// Обработка одного клиента (выполняется в ОТДЕЛЬНОМ потоке на каждого клиента)
+// Обработка одного клиента (выполняется в отдельном потоке на каждого клиента)
 //
 // Клиент -> сервер:
-//   имя клиента (UTF)                          — сразу после подключения
+//   имя клиента (UTF), сохранённый id (int, 0 = нет) — сразу после подключения
 //   "UPLOAD", имя файла, размер (long), байты  — загрузить файл на сервер
 //   "LIST"                                     — запросить список файлов
 //   "DOWNLOAD", имя файла                      — скачать файл
 //   "QUIT"                                     — выйти
 //
 // Сервер -> клиент:
-//   (тип, текст), где тип: "WELCOME" (текст = id), "OK", "ERR", "NEW_FILE", "FILES"
+//   (тип, текст), где тип: "WELCOME" (текст = "id|статус", статус: NEW/RETURNING/BUSY),
+//                          "OK", "ERR", "NEW_FILE", "FILES"
 //   "FILE", имя файла, размер (long), байты    — ответ на DOWNLOAD
 // ---------------------------------------------------------------------------
 object ClientHandler:
-  // Файлы, которые видны в list, но недоступны для download и upload
-  private val ProtectedFiles = Set("users.json")
-
   // Список активных клиентов: ключ — id. ConcurrentHashMap безопасна для многих потоков.
   val clients = ConcurrentHashMap[Int, ClientSession]()
-  // Счётчик для выдачи уникальных id (атомарный — безопасен при одновременных подключениях)
-  private val nextId = AtomicInteger(0)
+  // id выдаёт UserStore (под блокировкой synchronized), поэтому отдельный счётчик не нужен
 
   def handle(socket: Socket): Unit =
     var session: Option[ClientSession] = None
     try
-      val in  = DataInputStream(BufferedInputStream(socket.getInputStream))
+      val in = DataInputStream(BufferedInputStream(socket.getInputStream))
       val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream))
 
-      val name = in.readUTF()                       // первое, что присылает клиент — своё имя
-      // val s = ClientSession(nextId.incrementAndGet(), name, out)
-      val s = ClientSession(UserStore.register(name), name, out)
-      clients.put(s.id, s)
-      session = Some(s)
+      val name = in.readUTF()   // имя клиента
+      val savedId = in.readInt()   // id, который клиент запомнил с прошлого раза (0 = нет)
 
-      println(s"[Сервер] Клиент подключился: ${s.label}")
+      // Узнаём пользователя по паре (имя, id) или регистрируем нового
+      val (rec, returning) = UserStore.login(name, savedId)
+      var s = ClientSession(rec.id, rec.name, out)
+      var status = if returning then "RETURNING" else "NEW"
+
+      // Если этот id уже в сети, putIfAbsent вернёт существующую сессию — тогда выдаём новый id
+      if clients.putIfAbsent(s.id, s) != null then
+        val fresh = UserStore.register(name)
+        s = ClientSession(fresh.id, fresh.name, out)
+        clients.put(s.id, s)
+        status = "BUSY"
+      session = Some(s) // сессия создана
+
+      println(s"[Сервер] Клиент подключился: ${s.label} ($status)")
       printClients()
-      s.send("WELCOME", s.id.toString)              // сообщаем клиенту его id
+      s.send("WELCOME", s"${s.id}|$status")   // сообщаем клиенту его id и статус
 
       var running = true
       while running do
@@ -83,6 +88,7 @@ object ClientHandler:
     finally
       // Клиент ушёл — убираем из списка активных
       session.foreach: s =>
+        UserStore.touch(s.id) // запоминаем время последней активности
         clients.remove(s.id)
         println(s"[Сервер] Клиент отключился: ${s.label}")
         printClients()
@@ -90,14 +96,14 @@ object ClientHandler:
 
   // Приём файла от клиента и сохранение в папку сервера
   private def receiveFile(in: DataInputStream, s: ClientSession): Unit =
-    val rawName  = in.readUTF()
-    val size     = in.readLong()
+    val rawName = in.readUTF()
+    val size = in.readLong()
     // getFileName оставляет только имя файла (защита от путей вида ../../x)
     val fileName = Paths.get(rawName).getFileName.toString
 
-    if ProtectedFiles.contains(fileName) then
+    if Config.ProtectedFiles.contains(fileName) then
       // Клиент уже прислал заголовок и начал слать байты.
-      // Их ОБЯЗАТЕЛЬНО нужно вычитать из сокета, иначе они останутся
+      // Их нужно вычитать из сокета, иначе они останутся
       // в буфере и следующий in.readUTF() прочитает мусор вместо команды.
       IoUtil.skipExactly(in, size)
       s.send("ERR", s"Файл '$fileName' защищён и не может быть загружен")
@@ -127,7 +133,7 @@ object ClientHandler:
   private def sendRequestedFile(rawName: String, s: ClientSession): Unit =
     val fileName = Paths.get(rawName).getFileName.toString
 
-    if ProtectedFiles.contains(fileName) then
+    if Config.ProtectedFiles.contains(fileName) then
       s.send("ERR", s"Файл '$fileName' защищён и недоступен для скачивания")
       println(s"[Сервер] Отклонено скачивание защищённого файла '$fileName' клиентом ${s.label}")
     else
@@ -142,7 +148,7 @@ object ClientHandler:
   private def notifyOthers(uploader: ClientSession, fileName: String): Unit =
     for c <- clients.values.asScala if c.id != uploader.id do
       try c.send("NEW_FILE", s"Новый файл '$fileName' (загрузил ${uploader.label})")
-      catch case _: IOException => ()  // клиент мог отвалиться — его обработчик сам уберёт его из списка
+      catch case _: IOException => ()
 
   private def printClients(): Unit =
     println(s"[Сервер] Активные клиенты: ${clients.values.asScala.map(_.label).mkString(", ")}")
@@ -152,7 +158,7 @@ object ClientHandler:
 // Формат одного пакета:
 //   имя файла (UTF), размер файла (long), номер куска (int), всего кусков (int),
 //   длина данных (int), данные
-// Большие файлы режем на куски по ChunkSize байт.
+// Большие файлы разделяются по ChunkSize байт.
 // ---------------------------------------------------------------------------
 object Replicator:
   private val scheduler = Executors.newSingleThreadScheduledExecutor() // отдельный поток-таймер
@@ -164,7 +170,9 @@ object Replicator:
     scheduler.scheduleAtFixedRate(task, 10, Config.SyncIntervalSec, TimeUnit.SECONDS)
 
   private def syncAll(): Unit =
-    val files = Files.list(Paths.get(Config.MainStorage)).iterator().asScala.filter(Files.isRegularFile(_)).toList
+    val files = Files.list(Paths.get(Config.MainStorage)).iterator().asScala
+      .filter(p => Files.isRegularFile(p) && !Config.ProtectedFiles.contains(p.getFileName.toString))
+      .toList
     println(s"[Репликация] Рассылаю файлов: ${files.size}")
     val socket = DatagramSocket()
     try
@@ -177,7 +185,7 @@ object Replicator:
           val len  = math.min(Config.ChunkSize, data.length - from)
 
           val bytes = ByteArrayOutputStream()
-          val dos   = DataOutputStream(bytes)
+          val dos = DataOutputStream(bytes)
           dos.writeUTF(f.getFileName.toString)
           dos.writeLong(data.length.toLong)
           dos.writeInt(i)
@@ -196,13 +204,13 @@ object Replicator:
 // ---------------------------------------------------------------------------
 @main def mainServer(): Unit =
   Files.createDirectories(Paths.get(Config.MainStorage))
-  UserStore.load()      // ← загружаем пользователей до старта
-  Replicator.start()  // запускаем периодическую репликацию (свой поток)
+  UserStore.load() // загружаем пользователей до старта
+  Replicator.start() // запускаем периодическую репликацию (свой поток)
 
   val serverSocket = ServerSocket(Config.TcpPort)
   println(s"[Сервер] Запущен, порт ${Config.TcpPort}. Ожидаю клиентов...")
 
   while true do
-    val socket = serverSocket.accept()                  // ждём нового клиента
-    val t = Thread(() => ClientHandler.handle(socket))  // на каждого клиента — свой поток
+    val socket = serverSocket.accept() // ждём нового клиента
+    val t = Thread(() => ClientHandler.handle(socket)) // на каждого клиента — свой поток
     t.start()
