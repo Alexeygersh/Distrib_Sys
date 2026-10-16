@@ -182,7 +182,7 @@ object Replicator:
         val chunks = math.max(1, (data.length + Config.ChunkSize - 1) / Config.ChunkSize)
         for i <- 0 until chunks do
           val from = i * Config.ChunkSize
-          val len  = math.min(Config.ChunkSize, data.length - from)
+          val len = math.min(Config.ChunkSize, data.length - from)
 
           val bytes = ByteArrayOutputStream()
           val dos = DataOutputStream(bytes)

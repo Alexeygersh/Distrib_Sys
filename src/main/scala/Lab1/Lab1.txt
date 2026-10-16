@@ -1,0 +1,136 @@
+TCP - установка соединения (клиент → сервер)
+00 06  D0 90 D0 BD D1 8F   00 00 00 03
+len     "name" в MUTF-8    id - int 3
+  (2)         (6 байт)      (4 байта)
+
+
+Приветствие (сервер → клиент)
+s.send("WELCOME", s"${s.id}|$status")
+// send делает: out.writeUTF(msgType); out.writeUTF(text)
+
+пример: id = 3, status = "RETURNING"
+
+writeUTF("WELCOME")   00 07  "WELCOME"
+writeUTF("3|RETURNING")  00 0B  "3|RETURNING"
+
+Дальше все сообщения от сервера идут в формате «пара строк»:
+writeUTF(msgType)   // "OK", "ERR", "NEW_FILE", "FILES"
+writeUTF(text)      // произвольный текст
+
+это делает ClientSession.send
+
+
+UPLOAD
+out.writeUTF("UPLOAD")
+out.writeUTF(p.getFileName.toString)
+out.writeLong(Files.size(p))
+Files.copy(p, out)
+out.flush()
+
+00 06  55 50 4C 4F 41 44        -- writeUTF("UPLOAD"), 2+6 = 8 байт
+00 09  70 68 6F 74 6F 2E 6A 70 67   -- writeUTF("photo.jpg"), 2+9 = 11 байт
+00 00 00 00 00 00 13 88          -- writeLong(5000), 8 байт
+<N байт сырых данных>
+
+Сервер читает строго в том же порядке
+in.readUTF()   // "UPLOAD" — ветка match
+in.readUTF()   // "photo.jpg"
+in.readLong()  // 5000
+// потом IoUtil.copyExactly(in, fos, 5000)
+
+
+Ответ сервера на UPLOAD
+s.send("OK", s"Файл '$fileName' сохранён на сервере")
+
+writeUTF("OK")                                  -- 2 + 2 = 4 байта
+writeUTF("Файл 'photo.jpg' сохранён на сервере") -- 2 + N байт
+
+
+LIST — ответ сервера ф-ей ЫутвДшые
+
+
+DOWNLOAD - ответ сервера, ф-я sendFile
+
+00 04  46 49 4C 45             ← writeUTF("FILE")
+00 09  6E 6F 74 65 73 2E 74 78 74   ← writeUTF("notes.txt")
+00 00 00 00 00 00 00 78        ← writeLong(120)
+<120 байт содержимого>
+
+
+in.readUTF() match
+  case "FILE" =>
+    val fileName = Paths.get(in.readUTF()).getFileName.toString
+    val size = in.readLong()
+    IoUtil.copyExactly(in, fos, size)   // ровно size байт тела
+  case msgType =>
+    println(s"\n<< [$msgType] ${in.readUTF()}")   // второй readUTF — текст
+
+Порядок чтения критичен:
+    Читаем msgType (readUTF).
+    Если "FILE" -> читаем имя (readUTF), размер (readLong), тело (readFully/copyExactly).
+    Иначе -> читаем текст (readUTF) и печатаем.
+
+
+
+Клиент                             Сервер
+──────                             ──────
+writeUTF(name)           -->
+writeInt(savedId)        -->     readUTF, readInt
+                                                UserStore.login(...)
+                         <--     writeUTF("WELCOME")
+                         <--     writeUTF("id|status")
+
+{ основной цикл }
+
+writeUTF("UPLOAD")       -->
+writeUTF(fileName)       -->
+writeLong(size)          -->
+<size байт данных>       -->     readUTF, readUTF, readLong
+                                                copyExactly(size)
+                         <--     writeUTF("OK")
+                         <--     writeUTF("текст")
+
+writeUTF("LIST")         -->
+                         <--     writeUTF("FILES")
+                         <--     writeUTF("многострочный текст")
+
+writeUTF("DOWNLOAD")     -->
+writeUTF(fileName)       -->     readUTF, readUTF
+                         <--     writeUTF("FILE")
+                         <--     writeUTF(fileName)
+                         <--     writeLong(size)
+                         <--     <size байт>
+
+writeUTF("QUIT")         -->     readUTF → выход
+
+
+
+
+
+UDP Multicast: репликация основной -> резервные
+Replicator.syncAll:
+
+val bytes = ByteArrayOutputStream()
+val dos = DataOutputStream(bytes)
+dos.writeUTF(f.getFileName.toString)     // 2 + N байт - имя файла (длина строки)
+dos.writeLong(data.length.toLong)        // 8 байт - полный размер файла в байтах
+dos.writeInt(i)                          // 4 байта — индекс куска -номер куска (с 0)
+dos.writeInt(chunks)                     // 4 байта — всего кусков
+dos.writeInt(len)                        // 4 байта — длина данных в этом куске
+dos.write(data, from, len)               // len байт - сам кусок
+dos.flush()
+
+val packet = bytes.toByteArray
+socket.send(DatagramPacket(packet, packet.length, group, Config.MulticastPort))
+
+
+файл photo.jpg = 20000 байт, ChunkSize = 8000
+chunks = ceil(20000/8000) = 3.
+
+Кусок 0: index=0, len=8000, from=0
+Кусок 1: index=1, len=8000, from=8000
+Кусок 2: index=2, len=4000, from=16000
+
+Пакет 0:  writeUTF("photo.jpg") writeLong(20000) writeInt(0) writeInt(3) writeInt(8000)  <8000 байт>
+Пакет 1:  writeUTF("photo.jpg") writeLong(20000) writeInt(1) writeInt(3) writeInt(8000)  <8000 байт>
+Пакет 2:  writeUTF("photo.jpg") writeLong(20000) writeInt(2) writeInt(3) writeInt(4000)  <4000 байт>

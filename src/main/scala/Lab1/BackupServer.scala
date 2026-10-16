@@ -13,12 +13,12 @@ class FileAssembly(val totalSize: Long, chunkCount: Int):
   def add(index: Int, data: Array[Byte]): Unit =
     if chunks(index) == null then   // повторный кусок игнорируем
       chunks(index) = data
-      received += 1
+      received += 1 // число уникальных кусков
 
   def isComplete: Boolean = received == chunks.length
   def assemble(): Array[Byte] = chunks.flatten
 
-// Резервный сервер. Запуск: sbt "runMain backupServer 1"  (1 — номер резервного сервера)
+// Резервный сервер
 @main def backupServer(idArg: String = ""): Unit =
   val id: String =
     if idArg.nonEmpty then idArg
@@ -41,7 +41,10 @@ class FileAssembly(val totalSize: Long, chunkCount: Int):
 
 
   val socket = MulticastSocket(Config.MulticastPort)
-  socket.joinGroup(InetAddress.getByName(Config.MulticastGroup)) // вступаем в группу вещания
+  // socket.joinGroup(InetAddress.getByName(Config.MulticastGroup)) // вступаем в группу вещания
+  val group = new InetSocketAddress(InetAddress.getByName(Config.MulticastGroup), Config.MulticastPort)
+  socket.joinGroup(group, NetworkInterface.getByInetAddress(InetAddress.getLocalHost)) // вступаем в группу вещания
+
   println(s"[Резерв $id] Слушаю группу ${Config.MulticastGroup}:${Config.MulticastPort}")
 
   val assemblies = mutable.Map[String, FileAssembly]() // файлы, которые сейчас собираются
@@ -52,7 +55,7 @@ class FileAssembly(val totalSize: Long, chunkCount: Int):
     socket.receive(packet) // блокируется до прихода пакета
 
     val in     = DataInputStream(ByteArrayInputStream(packet.getData, 0, packet.getLength))
-    val name   = in.readUTF()
+    val name   = in.readUTF() // 2 byte
     val total  = in.readLong()
     val index  = in.readInt()
     val count  = in.readInt()
@@ -67,8 +70,8 @@ class FileAssembly(val totalSize: Long, chunkCount: Int):
     if !upToDate then
       // Если размер изменился (пришла новая версия) — начинаем сборку заново
       val asm = assemblies.get(name) match
-        case Some(a) if a.totalSize == total => a
-        case _ =>
+        case Some(a) if a.totalSize == total => a // продолжаем ту же сборку
+        case _ => // новая сборка
           val a = FileAssembly(total, count)
           assemblies(name) = a
           a
